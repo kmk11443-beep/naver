@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>안부세탁소 - 카메라 인식</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+
+<!--
+  ⚙️ 설정 방법
+  1) 아래 WEBAPP_URL 을 실제 배포된 안부세탁소 Apps Script 웹앱 주소(.../exec)로 바꾸세요.
+  2) 이 파일 하나를 GitHub 저장소에 올리고 GitHub Pages를 켜면 다음과 같은 주소가 생깁니다:
+     https://<GitHub아이디>.github.io/<저장소이름>/camera-relay.html
+  3) UserView.html에서 이 페이지를
+     https://<your-firebase-project>.web.app/camera-relay.html?code=A-001&mode=2
+     형태로 새 창(window.open)에서 엽니다. (mode: 2=청각/수어, 3=지체/안면)
+
+  📌 이 페이지가 필요한 이유
+  구글 Apps Script가 서비스하는 화면(UserView.html)은 구글의 보안 iframe 안에서 열리기 때문에
+  카메라 권한 요청 자체가 브라우저에 의해 차단됩니다. 이 페이지는 Apps Script 바깥의
+  '보통 웹페이지'로 열리므로 카메라 권한이 정상적으로 동작합니다.
+-->
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js" crossorigin="anonymous"></script>
+
+<style>
+  * { box-sizing:border-box; margin:0; padding:0; -webkit-tap-highlight-color:transparent; }
+  html, body { height:100%; }
+  body {
+    font-family:'Noto Sans KR',sans-serif; text-align:center; min-height:100vh;
+    display:flex; flex-direction:column; align-items:center; justify-content:center;
+    padding:20px; background:#0f172a; color:#f1f5f9;
+  }
+  body.mode-2 { background:#f0fdf4; color:#166534; }
+  body.mode-3 { background:#fdf4ff; color:#701a75; }
+
+  h2 { font-size:22px; margin-bottom:16px; }
+
+  #camBox {
+    position:relative; width:100%; max-width:340px; margin:10px auto;
+    border-radius:20px; overflow:hidden; background:#000; border:6px solid #cbd5e1;
+  }
+  #camCanvas { width:100%; height:auto; display:block; }
+  #statusBadge {
+    position:absolute; top:10px; left:10px; background:rgba(0,0,0,0.75); color:#fff;
+    padding:8px 14px; border-radius:10px; font-weight:700; font-size:15px; z-index:10;
+  }
+  #progressBar {
+    position:absolute; bottom:0; left:0; height:10px; background:#ef4444; width:0%;
+    transition:width 0.1s; z-index:10;
+  }
+  #hint { margin-top:18px; font-size:16px; font-weight:600; line-height:1.6; }
+
+  #resultScreen {
+    display:none; flex-direction:column; align-items:center; gap:12px;
+  }
+  #resultScreen.show { display:flex; }
+  #resultIcon { font-size:80px; }
+  #resultText { font-size:20px; font-weight:800; }
+  #closeHint { font-size:14px; color:#64748b; margin-top:10px; }
+
+  .hidden { display:none !important; }
+</style>
+</head>
+<body>
+
+  <h2 id="title">카메라 인식 준비 중...</h2>
+
+  <div id="camBox">
+    <div id="statusBadge">📸 카메라 준비 중...</div>
+    <video id="webcamVideo" autoplay playsinline style="display:none;"></video>
+    <canvas id="camCanvas" width="340" height="255"></canvas>
+    <div id="progressBar"></div>
+  </div>
+
+  <p id="hint"></p>
+
+  <div id="resultScreen">
+    <div id="resultIcon">✅</div>
+    <div id="resultText">접수되었습니다</div>
+    <div id="closeHint">이 창을 닫고 원래 화면으로 돌아가셔도 됩니다.</div>
+  </div>
+
+  <!-- Apps Script는 fetch/JSON 방식의 CORS를 안정적으로 지원하지 않으므로,
+       CORS 제약이 없는 표준 폼 전송(form submit) 방식을 사용합니다. -->
+  <form id="relayForm" method="POST" target="hidden_relay_frame">
+    <input type="hidden" name="code" id="fCode">
+    <input type="hidden" name="mode" id="fMode">
+  </form>
+  <iframe name="hidden_relay_frame" style="display:none"></iframe>
+
+  <script>
+    // ⚙️⚙️⚙️ 여기를 실제 배포 주소로 바꾸세요 ⚙️⚙️⚙️
+    const WEBAPP_URL = "https://script.google.com/macros/s/여기에_배포된_실행ID/exec";
+
+    const params = new URLSearchParams(location.search);
+    const USER_CODE = (params.get('code') || '').toUpperCase().trim();
+    const MODE = params.get('mode') || '2'; // 2:청각(수어) 3:지체(안면)
+    const TOKEN = params.get('token') || ''; // UserView.html이 발급한 1회용 토큰 - 그대로 되돌려 보낸다
+
+    let aiTimer = 0;
+    const REQUIRED_FRAMES = 60; // 약 2.5초 유지
+    let sent = false;
+
+    window.onload = function () {
+      document.body.className = 'mode-' + MODE;
+      document.getElementById('relayForm').action = WEBAPP_URL;
+
+      if (!USER_CODE) {
+        document.getElementById('title').innerText = '잘못된 접근입니다';
+        document.getElementById('hint').innerText = '이용자 화면에서 다시 시도해 주세요.';
+        return;
+      }
+
+      if (WEBAPP_URL.indexOf('여기에_배포된_실행ID') > -1) {
+        document.getElementById('title').innerText = '설정이 필요합니다';
+        document.getElementById('hint').innerText = 'camera-relay.html 파일의 WEBAPP_URL을 실제 배포 주소로 바꿔주세요.';
+        return;
+      }
+
+      if (MODE === '2') {
+        document.getElementById('title').innerText = '카메라에 손바닥을 보여주세요';
+        document.getElementById('hint').innerText = '손을 펴서 화면에 2~3초간 보여주시면 자동으로 접수됩니다.';
+        initHandsAI();
+      } else {
+        document.getElementById('title').innerText = '카메라를 보고 입을 벌려주세요';
+        document.getElementById('hint').innerText = '"아" 하고 입을 크게 벌려 2~3초간 유지하시면 자동으로 접수됩니다.';
+        initFaceAI();
+      }
+    };
+
+    function sendResult() {
+      if (sent) return;
+      sent = true;
+      document.getElementById('camBox').classList.add('hidden');
+      document.getElementById('hint').classList.add('hidden');
+      document.getElementById('title').innerText = '전송 중입니다...';
+
+      document.getElementById('fCode').value = USER_CODE;
+      document.getElementById('fMode').value = MODE;
+
+      const frame = document.querySelector('iframe[name="hidden_relay_frame"]');
+      frame.addEventListener('load', onRelayDone, { once: true });
+      document.getElementById('relayForm').submit();
+
+      // 혹시 iframe load 이벤트가 안 잡히는 환경 대비 taimeout 안전장치
+      setTimeout(onRelayDone, 4000);
+    }
+
+    let relayDone = false;
+    function onRelayDone() {
+      if (relayDone) return;
+      relayDone = true;
+      document.getElementById('title').classList.add('hidden');
+      document.getElementById('resultScreen').classList.add('show');
+
+      // 원래 이용자 화면(UserView.html) 탭에 접수 완료를 알림 (열려 있다면)
+      try {
+        if (window.opener) {
+          // targetOrigin은 '*'로 둡니다 - 이 메시지 내용(요청코드/모드/토큰)은 민감정보가 아니고,
+          // 실제 신뢰 판단은 받는 쪽(UserView.html)에서 origin+source+token 3중 검증으로 처리합니다.
+          window.opener.postMessage({ type: 'ANBU_CAM_SUCCESS', code: USER_CODE, mode: MODE, token: TOKEN }, '*');
+        }
+      } catch (e) {}
+
+      setTimeout(() => { try { window.close(); } catch (e) {} }, 2500);
+    }
+
+    // ✋ MediaPipe Hands (청각 모드)
+    function initHandsAI() {
+      const videoElement = document.getElementById('webcamVideo');
+      const canvasElement = document.getElementById('camCanvas');
+      const canvasCtx = canvasElement.getContext('2d');
+      const statusBadge = document.getElementById('statusBadge');
+      const progressBar = document.getElementById('progressBar');
+
+      const hands = new Hands({ locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}` });
+      hands.setOptions({ maxNumHands: 1, modelComplexity: 0, minDetectionConfidence: 0.6 });
+
+      hands.onResults((results) => {
+        canvasCtx.save();
+        canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+        canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+
+        if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+          const landmarks = results.multiHandLandmarks[0];
+          for (let i = 0; i < landmarks.length; i++) {
+            canvasCtx.beginPath();
+            canvasCtx.arc(landmarks[i].x * canvasElement.width, landmarks[i].y * canvasElement.height, 4, 0, 2 * Math.PI);
+            canvasCtx.fillStyle = '#22c55e'; canvasCtx.fill();
+          }
+          statusBadge.innerText = '✋ 손 감지됨! 유지하세요';
+          statusBadge.style.background = '#22c55e';
+          aiTimer++;
+          progressBar.style.width = (aiTimer / REQUIRED_FRAMES) * 100 + '%';
+          if (aiTimer >= REQUIRED_FRAMES) sendResult();
+        } else {
+          aiTimer = 0;
+          progressBar.style.width = '0%';
+          statusBadge.innerText = '손을 펴서 보여주세요';
+          statusBadge.style.background = 'rgba(0,0,0,0.75)';
+        }
+        canvasCtx.restore();
+      });
+
+      const camera = new Camera(videoElement, {
+        onFrame: async () => { if (!sent) await hands.send({ image: videoElement }); },
+        width: 340, height: 255
+      });
+      camera.start().catch(showCamError);
+    }
+
+    // 😮 MediaPipe FaceMesh (지체 모드 - 입 벌림 감지)
+    function initFaceAI() {
+      const videoElement = document.getElementById('webcamVideo');
+      const canvasElement = document.getElementById('camCanvas');
+      const canvasCtx = canvasElement.getContext('2d');
+      const statusBadge = document.getElementById('statusBadge');
+      const progressBar = document.getElementById('progressBar');
+
+      const faceMesh = new FaceMesh({ locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}` });
+      faceMesh.setOptions({ maxNumFaces: 1, refineLandmarks: false, minDetectionConfidence: 0.6 });
+
+      faceMesh.onResults((results) => {
+        canvasCtx.save();
+        canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+        canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+
+        if (results.multiFaceLandmarks && results.multiFaceLandmarks.length > 0) {
+          const landmarks = results.multiFaceLandmarks[0];
+          const upperLip = landmarks[13];
+          const lowerLip = landmarks[14];
+          const mouthOpenDistance = Math.abs(lowerLip.y - upperLip.y);
+
+          canvasCtx.beginPath();
+          canvasCtx.arc(upperLip.x * canvasElement.width, upperLip.y * canvasElement.height, 5, 0, 2 * Math.PI);
+          canvasCtx.arc(lowerLip.x * canvasElement.width, lowerLip.y * canvasElement.height, 5, 0, 2 * Math.PI);
+          canvasCtx.fillStyle = '#c026d3'; canvasCtx.fill();
+
+          if (mouthOpenDistance > 0.05) {
+            statusBadge.innerText = '😮 입 벌림 감지! 유지하세요';
+            statusBadge.style.background = '#c026d3';
+            aiTimer++;
+            progressBar.style.width = (aiTimer / REQUIRED_FRAMES) * 100 + '%';
+            if (aiTimer >= REQUIRED_FRAMES) sendResult();
+          } else {
+            aiTimer = 0;
+            progressBar.style.width = '0%';
+            statusBadge.innerText = "입을 '아' 하고 크게 벌리세요";
+            statusBadge.style.background = 'rgba(0,0,0,0.75)';
+          }
+        }
+        canvasCtx.restore();
+      });
+
+      const camera = new Camera(videoElement, {
+        onFrame: async () => { if (!sent) await faceMesh.send({ image: videoElement }); },
+        width: 340, height: 255
+      });
+      camera.start().catch(showCamError);
+    }
+
+    function showCamError() {
+      document.getElementById('title').innerText = '카메라를 사용할 수 없습니다';
+      document.getElementById('hint').innerText = '카메라 권한을 허용했는지 확인하시거나, 이용자 화면의 큰 버튼으로 요청해 주세요.';
+      document.getElementById('statusBadge').innerText = '⚠️ 카메라 오류';
+    }
+  </script>
+</body>
+</html>
